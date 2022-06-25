@@ -2,3 +2,4 @@ nanoemu
 .vscode
 .dbg.
 *.dSYM
+*.o

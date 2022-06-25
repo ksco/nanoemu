@@ -1,713 +1,7 @@
-#include <errno.h>
-#include <pthread.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
+#include "nanoemu.h"
 
-/* Xv6 uses only 128MiB of memory. */
-#define DRAM_SIZE 1024 * 1024 * 128
-
-/* Same as QEMU virt machine, DRAM starts at 0x80000000. */
-#define DRAM_BASE 0x80000000
-
-#define CLINT_BASE      0x2000000
-#define CLINT_SIZE      0x10000
-#define CLINT_MTIMECMP  CLINT_BASE + 0x4000
-#define CLINT_MTIME     CLINT_BASE + 0xbff8
-
-#define PLIC_BASE       0xc000000
-#define PLIC_SIZE       0x4000000
-#define PLIC_PENDING    PLIC_BASE + 0x1000
-#define PLIC_SENABLE    PLIC_BASE + 0x2080
-#define PLIC_SPRIORITY  PLIC_BASE + 0x201000
-#define PLIC_SCLAIM     PLIC_BASE + 0x201004
-
-#define UART_BASE   0x10000000
-#define UART_SIZE   0x100
-#define UART_RHR    UART_BASE + 0
-#define UART_THR    UART_BASE + 0
-#define UART_LCR    UART_BASE + 3
-#define UART_LSR    UART_BASE + 5
-#define UART_LSR_RX 1
-#define UART_LSR_TX 1 << 5
-
-#define VIRTIO_BASE             0x10001000
-#define VIRTIO_SIZE             0x1000
-#define VIRTIO_MAGIC            VIRTIO_BASE + 0x000
-#define VIRTIO_VERSION          VIRTIO_BASE + 0x004
-#define VIRTIO_DEVICE_ID        VIRTIO_BASE + 0x008
-#define VIRTIO_VENDOR_ID        VIRTIO_BASE + 0x00c
-#define VIRTIO_DEVICE_FEATURES  VIRTIO_BASE + 0x010
-#define VIRTIO_DRIVER_FEATURES  VIRTIO_BASE + 0x020
-#define VIRTIO_GUEST_PAGE_SIZE  VIRTIO_BASE + 0x028
-#define VIRTIO_QUEUE_SEL        VIRTIO_BASE + 0x030
-#define VIRTIO_QUEUE_NUM_MAX    VIRTIO_BASE + 0x034
-#define VIRTIO_QUEUE_NUM        VIRTIO_BASE + 0x038
-#define VIRTIO_QUEUE_PFN        VIRTIO_BASE + 0x040
-#define VIRTIO_QUEUE_NOTIFY     VIRTIO_BASE + 0x050
-#define VIRTIO_STATUS           VIRTIO_BASE + 0x070
-
-#define VIRTIO_VRING_DESC_SIZE  16
-#define VIRTIO_DESC_NUM         8
-
-#define VIRTIO_IRQ  1
-#define UART_IRQ    10
-
-/* Machine level CSRs */
-#define MSTATUS     0x300
-#define MEDELEG     0x302
-#define MIDELEG     0x303
-#define MIE         0x304
-#define MTVEC       0x305
-#define MEPC        0x341
-#define MCAUSE      0x342
-#define MTVAL       0x343
-#define MIP         0x344
-
-/* Supervisor level CSRs */
-#define SSTATUS     0x100
-#define SIE         0x104
-#define STVEC       0x105
-#define SEPC        0x141
-#define SCAUSE      0x142
-#define STVAL       0x143
-#define SIP         0x144
-#define SATP        0x180
-
-#define MIP_SSIP ((uint64_t)1 << 1)
-#define MIP_MSIP ((uint64_t)1 << 3)
-#define MIP_STIP ((uint64_t)1 << 5)
-#define MIP_MTIP ((uint64_t)1 << 7)
-#define MIP_SEIP ((uint64_t)1 << 9)
-#define MIP_MEIP ((uint64_t)1 << 11)
-
-#define PAGE_SIZE 4096
-
-enum exception {
-    OK                              = -1,
-    INSTRUCTION_ADDRESS_MISALIGNED  = 0,
-    INSTRUCTION_ACCESS_FAULT        = 1,
-    ILLEGAL_INSTRUCTION             = 2,
-    BREAKPOINT                      = 3,
-    LOAD_ADDRESS_MISALIGNED         = 4,
-    LOAD_ACCESS_FAULT               = 5,
-    STORE_AMO_ADDRESS_MISALIGNED    = 6,
-    STORE_AMO_ACCESS_FAULT          = 7,
-    ECALL_FROM_UMODE                = 8,
-    ECALL_FROM_SMODE                = 9,
-    ECALL_FROM_MMODE                = 11,
-    INSTRUCTION_PAGE_FAULT          = 12,
-    LOAD_PAGE_FAULT                 = 13,
-    STORE_AMO_PAGE_FAULT            = 15,
-};
-
-enum interrupt {
-    NONE                            = -1,
-    USER_SOFTWARE_INTERRUPT         = 0,
-    SUPERVISOR_SOFTWARE_INTERRUPT   = 1,
-    MACHINE_SOFTWARE_INTERRUPT      = 3,
-    USER_TIMER_INTERRUPT            = 4,
-    SUPERVISOR_TIMER_INTERRUPT      = 5,
-    MACHINE_TIMER_INTERRUPT         = 7,
-    USER_EXTERNAL_INTERRUPT         = 8,
-    SUPERVISOR_EXTERNAL_INTERRUPT   = 9,
-    MACHINE_EXTERNAL_INTERRUPT      = 11,
-};
-
-bool exception_is_fatal(enum exception exception) {
-    if (exception == INSTRUCTION_ADDRESS_MISALIGNED ||
-        exception == INSTRUCTION_ACCESS_FAULT ||
-        exception == LOAD_ACCESS_FAULT ||
-        exception == STORE_AMO_ADDRESS_MISALIGNED ||
-        exception == STORE_AMO_ACCESS_FAULT) {
-        return true;
-    }
-    return false;
-}
-
-struct dram {
-    uint8_t* data;
-};
-
-struct dram* dram_new(uint8_t* code, size_t code_size) {
-    struct dram* dram = calloc(1, sizeof *dram);
-    dram->data = calloc(DRAM_SIZE, 1);
-    memcpy(dram->data, code, code_size);
-    return dram;
-}
-
-uint64_t dram_load8(struct dram* dram, uint64_t addr) {
-    uint64_t index = addr - DRAM_BASE;
-    return dram->data[index];
-}
-
-uint64_t dram_load16(struct dram* dram, uint64_t addr) {
-    uint64_t index = addr - DRAM_BASE;
-    return (uint64_t)(dram->data[index])
-        | ((uint64_t)(dram->data[index + 1]) << 8);
-}
-
-uint64_t dram_load32(struct dram* dram, uint64_t addr) {
-    uint64_t index = addr - DRAM_BASE;
-    return (uint64_t)(dram->data[index])
-        | ((uint64_t)(dram->data[index + 1]) << 8)
-        | ((uint64_t)(dram->data[index + 2]) << 16)
-        | ((uint64_t)(dram->data[index + 3]) << 24);
-}
-
-uint64_t dram_load64(struct dram* dram, uint64_t addr) {
-    uint64_t index = addr - DRAM_BASE;
-    return (uint64_t)(dram->data[index])
-        | ((uint64_t)(dram->data[index + 1]) << 8)
-        | ((uint64_t)(dram->data[index + 2]) << 16)
-        | ((uint64_t)(dram->data[index + 3]) << 24)
-        | ((uint64_t)(dram->data[index + 4]) << 32)
-        | ((uint64_t)(dram->data[index + 5]) << 40)
-        | ((uint64_t)(dram->data[index + 6]) << 48)
-        | ((uint64_t)(dram->data[index + 7]) << 56);
-}
-
-enum exception
-dram_load(struct dram* dram, uint64_t addr, uint64_t size, uint64_t *result) {
-    switch (size) {
-    case 8:
-        *result = dram_load8(dram, addr);
-        return OK;
-    case 16:
-        *result = dram_load16(dram, addr);
-        return OK;
-    case 32:
-        *result = dram_load32(dram, addr);
-        return OK;
-    case 64:
-        *result = dram_load64(dram, addr);
-        return OK;
-    default:
-        return LOAD_ACCESS_FAULT;
-    }
-}
-
-void dram_store8(struct dram* dram, uint64_t addr, uint64_t value) {
-    uint64_t index = addr - DRAM_BASE;
-    dram->data[index] = value;
-}
-
-void dram_store16(struct dram* dram, uint64_t addr, uint64_t value) {
-    uint64_t index = addr - DRAM_BASE;
-    dram->data[index + 0] = (value >> 0) & 0xff;
-    dram->data[index + 1] = (value >> 8) & 0xff;
-}
-
-void dram_store32(struct dram* dram, uint64_t addr, uint64_t value) {
-    uint64_t index = addr - DRAM_BASE;
-    dram->data[index + 0] = (value >>  0) & 0xff;
-    dram->data[index + 1] = (value >>  8) & 0xff;
-    dram->data[index + 2] = (value >> 16) & 0xff;
-    dram->data[index + 3] = (value >> 24) & 0xff;
-}
-
-void dram_store64(struct dram* dram, uint64_t addr, uint64_t value) {
-    uint64_t index = addr - DRAM_BASE;
-    dram->data[index + 0] = (value >>  0) & 0xff;
-    dram->data[index + 1] = (value >>  8) & 0xff;
-    dram->data[index + 2] = (value >> 16) & 0xff;
-    dram->data[index + 3] = (value >> 24) & 0xff;
-    dram->data[index + 4] = (value >> 32) & 0xff;
-    dram->data[index + 5] = (value >> 40) & 0xff;
-    dram->data[index + 6] = (value >> 48) & 0xff;
-    dram->data[index + 7] = (value >> 56) & 0xff;
-}
-
-enum exception
-dram_store(struct dram* dram, uint64_t addr, uint64_t size, uint64_t value) {
-    switch (size) {
-    case 8:
-        dram_store8(dram, addr, value);
-        return OK;
-    case 16:
-        dram_store16(dram, addr, value);
-        return OK;
-    case 32:
-        dram_store32(dram, addr, value);
-        return OK;
-    case 64:
-        dram_store64(dram, addr, value);
-        return OK;
-    default:
-        return STORE_AMO_ACCESS_FAULT;
-    }
-}
-
-struct clint {
-    uint64_t mtime;
-    uint64_t mtimecmp;
-};
-
-struct clint* clint_new() {
-    struct clint* clint = calloc(1, sizeof *clint);
-    return clint;
-}
-
-enum exception
-clint_load(struct clint* clint, uint64_t addr, uint64_t size, uint64_t *result) {
-    switch (size) {
-    case 64:
-        switch (addr) {
-        case CLINT_MTIMECMP:
-            *result = clint->mtimecmp;
-            break;
-        case CLINT_MTIME:
-            *result = clint->mtime;
-            break;
-        default: *result = 0;
-        }
-        return OK;
-    default:
-        return LOAD_ACCESS_FAULT;
-    }
-}
-
-enum exception
-clint_store(struct clint* clint, uint64_t addr, uint64_t size, uint64_t value) {
-    switch (size) {
-    case 64:
-        switch (addr) {
-        case CLINT_MTIMECMP:
-            clint->mtimecmp = value;
-            break;
-        case CLINT_MTIME:
-            clint->mtime = value;
-            break;
-        }
-        return OK;
-    default:
-        return STORE_AMO_ACCESS_FAULT;
-    }
-}
-
-struct plic {
-    uint64_t pending;
-    uint64_t senable;
-    uint64_t spriority;
-    uint64_t sclaim;
-};
-
-struct plic* plic_new() {
-    struct plic* plic = calloc(1, sizeof *plic);
-    return plic;
-}
-
-enum exception
-plic_load(struct plic* plic, uint64_t addr, uint64_t size, uint64_t *result) {
-    switch (size) {
-    case 32:
-        switch (addr) {
-        case PLIC_PENDING:
-            *result = plic->pending;
-            break;
-        case PLIC_SENABLE:
-            *result = plic->senable;
-            break;
-        case PLIC_SPRIORITY:
-            *result = plic->spriority;
-            break;
-        case PLIC_SCLAIM:
-            *result = plic->sclaim;
-            break;
-        default: *result = 0;
-        }
-        return OK;
-    default:
-        return LOAD_ACCESS_FAULT;
-    }
-}
-
-enum exception
-plic_store(struct plic* plic, uint64_t addr, uint64_t size, uint64_t value) {
-    switch (size) {
-    case 32:
-        switch (addr) {
-        case PLIC_PENDING:
-            plic->pending = value;
-            break;
-        case PLIC_SENABLE:
-            plic->senable = value;
-            break;
-        case PLIC_SPRIORITY:
-            plic->spriority = value;
-            break;
-        case PLIC_SCLAIM:
-            plic->sclaim = value;
-            break;
-        }
-        return OK;
-    default:
-        return STORE_AMO_ACCESS_FAULT;
-    }
-}
-
-struct uart {
-    uint8_t data[UART_SIZE];
-    bool interrupting;
-
-    pthread_t tid;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-};
-
-void* uart_thread(void* opaque) {
-    struct uart* uart = opaque;
-    while (1) {
-        char c;
-        read(STDIN_FILENO, &c, 1);
-        pthread_mutex_lock(&uart->lock);
-        while ((uart->data[UART_LSR - UART_BASE] & UART_LSR_RX) == 1) {
-            pthread_cond_wait(&uart->cond, &uart->lock);
-        }
-        uart->data[0] = c;
-        uart->interrupting = true;
-        uart->data[UART_LSR - UART_BASE] |= UART_LSR_RX;
-        pthread_mutex_unlock(&uart->lock);
-    }
-
-    /* Unreachable. */
-    return NULL;
-}
-
-struct uart* uart_new() {
-    struct uart* uart = calloc(1, sizeof *uart);
-    uart->data[UART_LSR - UART_BASE] |= UART_LSR_TX;
-    pthread_mutex_init(&uart->lock, NULL);
-    pthread_cond_init(&uart->cond, NULL);
-
-    pthread_create(&uart->tid, NULL, uart_thread, (void*)uart);
-    return uart;
-}
-
-enum exception
-uart_load(struct uart* uart, uint64_t addr, uint64_t size, uint64_t *result) {
-    switch (size) {
-    case 8:
-        pthread_mutex_lock(&uart->lock);
-        switch (addr) {
-        case UART_RHR:
-            pthread_cond_broadcast(&uart->cond);
-            uart->data[UART_LSR - UART_BASE] &= ~UART_LSR_RX;
-        default:
-            *result = uart->data[addr - UART_BASE];
-        }
-        pthread_mutex_unlock(&uart->lock);
-        return OK;
-    default:
-        return LOAD_ACCESS_FAULT;
-    }
-}
-
-enum exception
-uart_store(struct uart* uart, uint64_t addr, uint64_t size, uint64_t value) {
-    switch (size) {
-    case 8:
-        pthread_mutex_lock(&uart->lock);
-        switch (addr) {
-        case UART_THR:
-            printf("%c", (char)(value & 0xff));
-            fflush(stdout);
-            break;
-        default:
-            uart->data[addr - UART_BASE] = value & 0xff;
-        }
-        pthread_mutex_unlock(&uart->lock);
-        return OK;
-    default:
-        return STORE_AMO_ACCESS_FAULT;
-    }
-}
-
-bool uart_interrupting(struct uart* uart) {
-    pthread_mutex_lock(&uart->lock);
-    bool interrupting = uart->interrupting;
-    uart->interrupting = false;
-    pthread_mutex_unlock(&uart->lock);
-    return interrupting;
-}
-
-struct virtio {
-    uint64_t id;
-    uint32_t driver_features;
-    uint32_t page_size;
-    uint32_t queue_sel;
-    uint32_t queue_num;
-    uint32_t queue_pfn;
-    uint32_t queue_notify;
-    uint32_t status;
-    uint8_t *disk;
-};
-
-struct virtio* virtio_new(uint8_t* disk) {
-    struct virtio* virtio = calloc(1, sizeof *virtio);
-    virtio->disk = disk;
-    virtio->queue_notify = -1;
-    return virtio;
-}
-
-
-enum exception
-virtio_load(struct virtio* virtio, uint64_t addr, uint64_t size, uint64_t *result) {
-    switch (size) {
-    case 32:
-        switch (addr) {
-        case VIRTIO_MAGIC:
-            *result = 0x74726976;
-            break;
-        case VIRTIO_VERSION:
-            *result = 0x1;
-            break;
-        case VIRTIO_DEVICE_ID:
-            *result = 0x2;
-            break;
-        case VIRTIO_VENDOR_ID:
-            *result = 0x554d4551;
-            break;
-        case VIRTIO_DEVICE_FEATURES:
-            *result = 0;
-            break;
-        case VIRTIO_DRIVER_FEATURES:
-            *result = virtio->driver_features;
-            break;
-        case VIRTIO_QUEUE_NUM_MAX:
-            *result = 8;
-            break;
-        case VIRTIO_QUEUE_PFN:
-            *result = virtio->queue_pfn;
-            break;
-        case VIRTIO_STATUS:
-            *result = virtio->status;
-            break;
-        default: *result = 0;
-        }
-        return OK;
-    default:
-        return LOAD_ACCESS_FAULT;
-    }
-}
-
-enum exception
-virtio_store(struct virtio* virtio, uint64_t addr, uint64_t size, uint64_t value) {
-    switch (size) {
-    case 32:
-        switch (addr) {
-        case VIRTIO_DEVICE_FEATURES:
-            virtio->driver_features = value;
-            break;
-        case VIRTIO_GUEST_PAGE_SIZE:
-            virtio->page_size = value;
-            break;
-        case VIRTIO_QUEUE_SEL:
-            virtio->queue_sel = value;
-            break;
-        case VIRTIO_QUEUE_NUM:
-            virtio->queue_num = value;
-            break;
-        case VIRTIO_QUEUE_PFN:
-            virtio->queue_pfn = value;
-            break;
-        case VIRTIO_QUEUE_NOTIFY:
-            virtio->queue_notify = value;
-            break;
-        case VIRTIO_STATUS:
-            virtio->status = value;
-            break;
-        }
-        return OK;
-    default:
-        return STORE_AMO_ACCESS_FAULT;
-    }
-}
-
-bool virtio_is_interrupting(struct virtio* virtio) {
-    if (virtio->queue_notify != -1) {
-        virtio->queue_notify = -1;
-        return true;
-    }
-    return false;
-}
-
-uint64_t virtio_desc_addr(struct virtio* virtio) {
-    return (uint64_t)virtio->queue_pfn * (uint64_t)virtio->page_size;
-}
-
-uint64_t virtio_disk_read(struct virtio* virtio, uint64_t addr) {
-    return virtio->disk[addr];
-}
-
-void virtio_disk_write(struct virtio* virtio, uint64_t addr, uint64_t value) {
-    virtio->disk[addr] = (uint8_t)value;
-}
-
-uint64_t virtio_new_id(struct virtio* virtio) {
-    virtio->id += 1;
-    return virtio->id;
-}
-
-struct bus {
-    struct dram* dram;
-    struct clint* clint;
-    struct plic* plic;
-    struct uart* uart;
-    struct virtio *virtio;
-};
-
-struct bus* bus_new(struct dram* dram, struct virtio* virtio) {
-    struct bus* bus = calloc(1, sizeof *bus);
-    bus->dram = dram;
-    bus->virtio = virtio;
-    bus->clint = clint_new();
-    bus->plic = plic_new();
-    bus->uart = uart_new();
-    return bus;
-}
-
-enum exception
-bus_load(struct bus* bus, uint64_t addr, uint64_t size, uint64_t *result) {
-    if (CLINT_BASE <= addr && addr < CLINT_BASE + CLINT_SIZE) {
-        return clint_load(bus->clint, addr, size, result);
-    }
-    if (PLIC_BASE <= addr && addr < PLIC_BASE + PLIC_SIZE) {
-        return plic_load(bus->plic, addr, size, result);
-    }
-    if (UART_BASE <= addr && addr < UART_BASE + UART_SIZE) {
-        return uart_load(bus->uart, addr, size, result);
-    }
-    if (VIRTIO_BASE <= addr && addr < VIRTIO_BASE + VIRTIO_SIZE) {
-        return virtio_load(bus->virtio, addr, size, result);
-    }
-    if (DRAM_BASE <= addr) {
-        return dram_load(bus->dram, addr, size, result);
-    }
-
-    return LOAD_ACCESS_FAULT;
-}
-
-enum exception
-bus_store(struct bus* bus, uint64_t addr, uint64_t size, uint64_t value) {
-    if (CLINT_BASE <= addr && addr < CLINT_BASE + CLINT_SIZE) {
-        return clint_store(bus->clint, addr, size, value);
-    }
-    if (PLIC_BASE <= addr && addr < PLIC_BASE + PLIC_SIZE) {
-        return plic_store(bus->plic, addr, size, value);
-    }
-    if (UART_BASE <= addr && addr < UART_BASE + UART_SIZE) {
-        return uart_store(bus->uart, addr, size, value);
-    }
-    if (VIRTIO_BASE <= addr && addr < VIRTIO_BASE + VIRTIO_SIZE) {
-        return virtio_store(bus->virtio, addr, size, value);
-    }
-    if (DRAM_BASE <= addr) {
-        return dram_store(bus->dram, addr, size, value);
-    }
-
-    return STORE_AMO_ACCESS_FAULT;
-}
-
-void bus_disk_access(struct bus* bus) {
-    uint64_t desc_addr = virtio_desc_addr(bus->virtio);
-    uint64_t avail_addr = desc_addr + 0x40;
-    uint64_t used_addr = desc_addr + 4096;
-
-    uint64_t offset;
-    if (bus_load(bus, avail_addr + 1, 16, &offset) != OK) {
-        printf("ERROR: failed to read offset.\n");
-        exit(1);
-    }
-
-    uint64_t index;
-    if (bus_load(bus, avail_addr + (offset % VIRTIO_DESC_NUM) + 2, 16, &index) != OK) {
-        printf("ERROR: failed to read index.\n");
-        exit(1);
-    }
-
-    uint64_t desc_addr0 = desc_addr + VIRTIO_VRING_DESC_SIZE * index;
-    uint64_t addr0;
-    if (bus_load(bus, desc_addr0, 64, &addr0) != OK) {
-        printf("ERROR: failed to read address field in descriptor.\n");
-        exit(1);
-    }
-    uint64_t next0;
-    if (bus_load(bus, desc_addr0 + 14, 16, &next0) != OK) {
-        printf("ERROR: failed to read next field in descriptor.\n");
-        exit(1);
-    }
-    uint64_t desc_addr1 = desc_addr + VIRTIO_VRING_DESC_SIZE * next0;
-    uint64_t addr1;
-    if (bus_load(bus, desc_addr1, 64, &addr1) != OK) {
-        printf("ERROR: failed to read address field in descriptor.\n");
-        exit(1);
-    }
-    uint64_t len1;
-    if (bus_load(bus, desc_addr1 + 8, 32, &len1) != OK) {
-        printf("ERROR: failed to read length field in descriptor.\n");
-        exit(1);
-    }
-    uint64_t flags1;
-    if (bus_load(bus, desc_addr1 + 12, 16, &flags1) != OK) {
-        printf("ERROR: failed to read flags field in descriptor.\n");
-        exit(1);
-    }
-
-    uint64_t blk_sector;
-    if (bus_load(bus, addr0 + 8, 64, &blk_sector) != OK) {
-        printf("ERROR: failed to read sector field in virtio_blk_outhdr.\n");
-        exit(1);
-    }
-
-    if ((flags1 & 2) == 0) {
-        /* Read dram data and write it to a disk directly (DMA). */
-        for (uint64_t i = 0; i < len1; i++) {
-            uint64_t data;
-            if (bus_load(bus, addr1 + i, 8, &data) != OK) {
-                printf("ERROR: failed to read from dram.\n");
-                exit(1);
-            }
-            virtio_disk_write(bus->virtio, blk_sector * 512 + i, data);
-        }
-    } else {
-        /* Read disk data and write it to dram directly (DMA). */
-        for (uint64_t i = 0; i < len1; i++) {
-            uint64_t data = virtio_disk_read(bus->virtio, blk_sector * 512 + i);
-            if (bus_store(bus, addr1 +i, 8, data) != OK) {
-                printf("ERROR: failed to write to dram.\n");
-                exit(1);
-            }
-        }
-    }
-
-    uint64_t new_id = virtio_new_id(bus->virtio);
-    if (bus_store(bus, used_addr + 2, 16, new_id % 8) != OK) {
-        printf("ERROR: failed to write to dram.\n");
-        exit(1);
-    }
-}
-
-enum mode {
-    USER = 0x0,
-    SUPERVISOR = 0x1,
-    MACHINE = 0x3
-};
-
-struct cpu {
-    uint64_t regs[32];
-    uint64_t pc;
-    uint64_t csrs[4096];
-    enum mode mode;
-    struct bus* bus;
-    bool enable_paging;
-    uint64_t pagetable;
-};
-
-struct cpu* cpu_new(uint8_t* code, size_t code_size, uint8_t* disk) {
+struct cpu*
+cpu_new(uint8_t* code, size_t code_size, uint8_t* disk) {
     struct cpu* cpu = calloc(1, sizeof *cpu);
 
     /* Initialize the sp(x2) register. */
@@ -720,8 +14,8 @@ struct cpu* cpu_new(uint8_t* code, size_t code_size, uint8_t* disk) {
     return cpu;
 }
 
-uint64_t cpu_load_csr(struct cpu* cpu, uint16_t addr);
-void cpu_update_paging(struct cpu* cpu, uint16_t csr_addr) {
+void
+cpu_update_paging(struct cpu* cpu, uint16_t csr_addr) {
     if (csr_addr != SATP) return;
 
     cpu->pagetable = (cpu_load_csr(cpu, SATP) & (((uint64_t)1 << 44) - 1)) * PAGE_SIZE;
@@ -799,7 +93,8 @@ cpu_translate(struct cpu* cpu, uint64_t addr, enum exception e, uint64_t *result
 }
 
 /* Fetch an instruction from current PC from DRAM. */
-enum exception cpu_fetch(struct cpu* cpu, uint64_t* result) {
+enum exception
+cpu_fetch(struct cpu* cpu, uint64_t* result) {
     uint64_t ppc;
     enum exception exception;
     if ((exception = cpu_translate(cpu, cpu->pc, INSTRUCTION_PAGE_FAULT, &ppc)) != OK) {
@@ -811,14 +106,16 @@ enum exception cpu_fetch(struct cpu* cpu, uint64_t* result) {
     return OK;
 }
 
-uint64_t cpu_load_csr(struct cpu* cpu, uint16_t addr) {
+uint64_t
+cpu_load_csr(struct cpu* cpu, uint16_t addr) {
     if (addr == SIE) {
         return cpu->csrs[MIE] & cpu->csrs[MIDELEG];
     }
     return cpu->csrs[addr];
 }
 
-void cpu_store_csr(struct cpu* cpu, uint16_t addr, uint64_t value) {
+void
+cpu_store_csr(struct cpu* cpu, uint16_t addr, uint64_t value) {
     if (addr == SIE) {
         cpu->csrs[MIE] = (cpu->csrs[MIE] & ~cpu->csrs[MIDELEG]) | (value & cpu->csrs[MIDELEG]);
         return;
@@ -846,7 +143,8 @@ cpu_store(struct cpu* cpu, uint64_t addr, uint64_t size, uint64_t value) {
     return bus_store(cpu->bus, pa, size, value);
 }
 
-void cpu_dump_csrs(struct cpu* cpu) {
+void
+cpu_dump_csrs(struct cpu* cpu) {
     printf("mstatus=0x%016llx mtvec=0x%016llx mepc=0x%016llx mcause=0x%016llx\n",
         cpu_load_csr(cpu, MSTATUS),
         cpu_load_csr(cpu, MTVEC),
@@ -859,7 +157,8 @@ void cpu_dump_csrs(struct cpu* cpu) {
         cpu_load_csr(cpu, SCAUSE));
 }
 
-enum exception cpu_execute(struct cpu* cpu, uint64_t inst) {
+enum exception
+cpu_execute(struct cpu* cpu, uint64_t inst) {
     uint64_t opcode = inst & 0x7f;
     uint64_t rd = (inst >> 7) & 0x1f;
     uint64_t rs1 = (inst >> 15) & 0x1f;
@@ -1295,7 +594,8 @@ enum exception cpu_execute(struct cpu* cpu, uint64_t inst) {
     return OK;
 }
 
-void cpu_dump_registers(struct cpu* cpu) {
+void
+cpu_dump_registers(struct cpu* cpu) {
     char* abi[32] = {
         "zero", " ra ", " sp ", " gp ", " tp ", " t0 ", " t1 ", " t2 ", " s0 ", " s1 ", " a0 ",
         " a1 ", " a2 ", " a3 ", " a4 ", " a5 ", " a6 ", " a7 ", " s2 ", " s3 ", " s4 ", " s5 ",
@@ -1310,7 +610,8 @@ void cpu_dump_registers(struct cpu* cpu) {
     }
 }
 
-void cpu_take_trap(struct cpu* cpu, enum exception exception, enum interrupt interrupt) {
+void
+cpu_take_trap(struct cpu* cpu, enum exception exception, enum interrupt interrupt) {
     uint64_t exception_pc = cpu->pc - 4;
     enum mode previous_mode = cpu->mode;
 
@@ -1360,7 +661,8 @@ void cpu_take_trap(struct cpu* cpu, enum exception exception, enum interrupt int
     }
 }
 
-enum interrupt cpu_check_pending_interrupt(struct cpu* cpu) {
+enum interrupt
+cpu_check_pending_interrupt(struct cpu* cpu) {
     if (cpu->mode == MACHINE) {
         if (((cpu_load_csr(cpu, MSTATUS) >> 3) & 1) == 0) {
             return NONE;
@@ -1411,79 +713,4 @@ enum interrupt cpu_check_pending_interrupt(struct cpu* cpu) {
     }
 
     return NONE;
-}
-
-size_t read_file(FILE* f, uint8_t** r) {
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    uint8_t* content = malloc(fsize + 1);
-    fread(content, fsize, 1, f);
-    fclose(f);
-    content[fsize] = 0;
-    *r = content;
-
-    return fsize;
-}
-
-int main(int argc, char** argv) {
-    if (argc != 2 && argc != 3) {
-        printf("Usage: nanoemu <filename> [<image>]\n");
-        exit(1);
-    }
-
-    FILE *f = fopen(argv[1], "rb");
-    if (f == NULL) {
-        printf("ERROR: %s\n", strerror(errno));
-    }
-
-    uint8_t* binary = NULL;
-    uint8_t* disk = NULL;
-    size_t fsize = read_file(f, &binary);
-
-    if (argc == 3) {
-        FILE *f = fopen(argv[2], "rb");
-        if (f == NULL) {
-            printf("ERROR: %s\n", strerror(errno));
-        }
-        read_file(f, &disk);
-    }
-
-    struct cpu* cpu = cpu_new(binary, fsize, disk);
-    free(binary);
-
-    while (1) {
-        /* Fetch instruction. */
-        uint64_t inst;
-        enum exception exception;
-        enum interrupt interrupt;
-        if ((exception = cpu_fetch(cpu, &inst)) != OK) {
-            cpu_take_trap(cpu, exception, NONE);
-            if (exception_is_fatal(exception)) {
-                break;
-            }
-            inst = 0;
-        }
-
-        /* Advance PC. */
-        cpu->pc += 4;
-
-        /* Decode & execute. */
-        if ((exception = cpu_execute(cpu, inst)) != OK) {
-            cpu_take_trap(cpu, exception, NONE);
-            if (exception_is_fatal(exception)) {
-                break;
-            }
-        }
-
-        if ((interrupt = cpu_check_pending_interrupt(cpu)) != NONE) {
-            cpu_take_trap(cpu, OK, interrupt);
-        }
-    }
-
-    cpu_dump_registers(cpu);
-    printf("----------------------------------------------------------------------------------------------------------------------\n");
-    cpu_dump_csrs(cpu);
-    return 0;
 }
