@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <inttypes.h>
+
+#define SUPRESS_RETURN(x) (void)((x)+1)
 
 /* Xv6 uses only 128MiB of memory. */
 #define DRAM_SIZE 1024 * 1024 * 128

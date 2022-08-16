@@ -145,12 +145,12 @@ cpu_store(struct cpu* cpu, uint64_t addr, uint64_t size, uint64_t value) {
 
 void
 cpu_dump_csrs(struct cpu* cpu) {
-    printf("mstatus=0x%016llx mtvec=0x%016llx mepc=0x%016llx mcause=0x%016llx\n",
+    printf("mstatus=0x%016"PRIx64" mtvec=0x%016"PRIx64" mepc=0x%016"PRIx64" mcause=0x%016"PRIx64"\n",
         cpu_load_csr(cpu, MSTATUS),
         cpu_load_csr(cpu, MTVEC),
         cpu_load_csr(cpu, MEPC),
         cpu_load_csr(cpu, MCAUSE));
-    printf("sstatus=0x%016llx stvec=0x%016llx sepc=0x%016llx scause=0x%016llx\n",
+    printf("sstatus=0x%016"PRIx64" stvec=0x%016"PRIx64" sepc=0x%016"PRIx64" scause=0x%016"PRIx64"\n",
         cpu_load_csr(cpu, SSTATUS),
         cpu_load_csr(cpu, STVEC),
         cpu_load_csr(cpu, SEPC),
@@ -603,10 +603,10 @@ cpu_dump_registers(struct cpu* cpu) {
     };
 
     for (int i = 0; i < 32; i += 4) {
-        printf("x%-2d(%4s)=0x%016llx  ", i + 0, abi[i + 0], cpu->regs[i + 0]);
-        printf("x%-2d(%4s)=0x%016llx  ", i + 1, abi[i + 1], cpu->regs[i + 1]);
-        printf("x%-2d(%4s)=0x%016llx  ", i + 2, abi[i + 2], cpu->regs[i + 2]);
-        printf("x%-2d(%4s)=0x%016llx\n", i + 3, abi[i + 3], cpu->regs[i + 3]);
+        printf("x%-2d(%4s)=0x%016"PRIx64"  ", i + 0, abi[i + 0], cpu->regs[i + 0]);
+        printf("x%-2d(%4s)=0x%016"PRIx64"  ", i + 1, abi[i + 1], cpu->regs[i + 1]);
+        printf("x%-2d(%4s)=0x%016"PRIx64"  ", i + 2, abi[i + 2], cpu->regs[i + 2]);
+        printf("x%-2d(%4s)=0x%016"PRIx64"\n", i + 3, abi[i + 3], cpu->regs[i + 3]);
     }
 }
 

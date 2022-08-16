@@ -1,4 +1,4 @@
-CFLAGS=-O2 -Wall -Werror -pedantic-errors
+CFLAGS=-O2 -Wall -pthread -Werror -pedantic-errors
 SRCS=$(wildcard src/*.c)
 OBJS=$(SRCS:.c=.o)
 

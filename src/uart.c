@@ -5,7 +5,7 @@ uart_thread(void* opaque) {
     struct uart* uart = opaque;
     while (1) {
         char c;
-        read(STDIN_FILENO, &c, 1);
+        SUPRESS_RETURN(read(STDIN_FILENO, &c, 1));
         pthread_mutex_lock(&uart->lock);
         while ((uart->data[UART_LSR - UART_BASE] & UART_LSR_RX) == 1) {
             pthread_cond_wait(&uart->cond, &uart->lock);
